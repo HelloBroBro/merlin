@@ -35,10 +35,10 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/kubernetes/fake"
 	fakecorev1 "k8s.io/client-go/kubernetes/typed/core/v1/fake"
 	fakepolicyv1 "k8s.io/client-go/kubernetes/typed/policy/v1/fake"
-	k8stesting "k8s.io/client-go/testing"
 	ktesting "k8s.io/client-go/testing"
 	"knative.dev/pkg/apis"
 	duckv1 "knative.dev/pkg/apis/duck/v1"
@@ -98,7 +98,31 @@ type vsReactor struct {
 	err error
 }
 
-var clusterMetadata = Metadata{GcpProject: "my-gcp", ClusterName: "my-cluster"}
+type isvcWatchReactor struct {
+	result chan watch.Event
+}
+
+func newIsvcWatchReactor(isvc *kservev1beta1.InferenceService) *isvcWatchReactor {
+	w := &isvcWatchReactor{result: make(chan watch.Event, 1)}
+	w.result <- watch.Event{Type: watch.Added, Object: isvc}
+	return w
+}
+
+func (w *isvcWatchReactor) Handles(action ktesting.Action) bool {
+	return action.GetResource().Resource == inferenceServiceResource
+}
+
+func (w *isvcWatchReactor) React(action ktesting.Action) (handled bool, ret watch.Interface, err error) {
+	return true, watch.NewProxyWatcher(w.result), nil
+}
+
+var (
+	clusterMetadata = Metadata{GcpProject: "my-gcp", ClusterName: "my-cluster"}
+
+	userContainerCPUDefaultLimit          = "8"
+	userContainerCPULimitRequestFactor    = float64(0)
+	userContainerMemoryLimitRequestFactor = float64(2)
+)
 
 // TestDeployInferenceServiceNamespaceCreation test namespaceResource creation when deploying inference service
 func TestController_DeployInferenceService_NamespaceCreation(t *testing.T) {
@@ -276,12 +300,11 @@ func TestController_DeployInferenceService_NamespaceCreation(t *testing.T) {
 			knClient := knservingfake.NewSimpleClientset().ServingV1()
 
 			kfClient := fakekserve.NewSimpleClientset().ServingV1beta1().(*fakekservev1beta1.FakeServingV1beta1)
-			kfClient.PrependReactor(getMethod, inferenceServiceResource, func(action ktesting.Action) (handled bool, ret runtime.Object, err error) {
-				return true, isvc, nil
-			})
 			kfClient.PrependReactor(createMethod, inferenceServiceResource, func(action ktesting.Action) (handled bool, ret runtime.Object, err error) {
 				return true, isvc, nil
 			})
+			isvcWatchReactor := newIsvcWatchReactor(isvc)
+			kfClient.WatchReactionChain = []ktesting.WatchReactor{isvcWatchReactor}
 
 			v1Client := fake.NewSimpleClientset().CoreV1()
 
@@ -304,9 +327,12 @@ func TestController_DeployInferenceService_NamespaceCreation(t *testing.T) {
 			})
 
 			deployConfig := config.DeploymentConfig{
-				NamespaceTimeout:             tt.nsTimeout,
-				DeploymentTimeout:            2 * tickDurationSecond * time.Second,
-				DefaultModelResourceRequests: &config.ResourceRequests{},
+				NamespaceTimeout:                      tt.nsTimeout,
+				DeploymentTimeout:                     2 * tickDurationSecond * time.Second,
+				DefaultModelResourceRequests:          &config.ResourceRequests{},
+				UserContainerCPUDefaultLimit:          userContainerCPUDefaultLimit,
+				UserContainerCPULimitRequestFactor:    userContainerCPULimitRequestFactor,
+				UserContainerMemoryLimitRequestFactor: userContainerMemoryLimitRequestFactor,
 			}
 
 			containerFetcher := NewContainerFetcher(v1Client, clusterMetadata)
@@ -453,7 +479,10 @@ func TestController_DeployInferenceService(t *testing.T) {
 				nil,
 				errors.New("error creating inference service"),
 			},
-			checkResult:     nil,
+			checkResult: &inferenceServiceReactor{
+				nil,
+				kerrors.NewNotFound(schema.GroupResource{}, ""),
+			},
 			deployTimeout:   deployTimeout,
 			createPdbResult: &pdbReactor{pdb, nil},
 			createVsResult:  &vsReactor{vs, nil},
@@ -552,7 +581,7 @@ func TestController_DeployInferenceService(t *testing.T) {
 			wantError:       true,
 		},
 		{
-			name:         "error: timeout",
+			name:         "error: isvc timeout",
 			modelService: modelSvc,
 			createResult: &inferenceServiceReactor{
 				&kservev1beta1.InferenceService{ObjectMeta: metav1.ObjectMeta{Name: isvcName, Namespace: project.Name}},
@@ -565,7 +594,7 @@ func TestController_DeployInferenceService(t *testing.T) {
 				},
 				nil,
 			},
-			deployTimeout: 1 * time.Millisecond,
+			deployTimeout: 1 * time.Microsecond,
 			wantError:     true,
 		},
 		{
@@ -633,13 +662,13 @@ func TestController_DeployInferenceService(t *testing.T) {
 			knClient := knservingfake.NewSimpleClientset()
 
 			kfClient := fakekserve.NewSimpleClientset().ServingV1beta1().(*fakekservev1beta1.FakeServingV1beta1)
-			kfClient.PrependReactor(getMethod, inferenceServiceResource, func(action ktesting.Action) (handled bool, ret runtime.Object, err error) {
-				return true, tt.checkResult.isvc, tt.checkResult.err
-			})
+			if tt.checkResult != nil && tt.checkResult.isvc != nil {
+				isvcWatchReactor := newIsvcWatchReactor(tt.checkResult.isvc)
+				kfClient.WatchReactionChain = []ktesting.WatchReactor{isvcWatchReactor}
+			}
 			kfClient.PrependReactor(createMethod, inferenceServiceResource, func(action ktesting.Action) (handled bool, ret runtime.Object, err error) {
 				return true, tt.createResult.isvc, tt.createResult.err
 			})
-
 			kfClient.PrependReactor(deleteMethod, inferenceServiceResource, func(action ktesting.Action) (handled bool, ret runtime.Object, err error) {
 				return true, nil, nil
 			})
@@ -656,9 +685,11 @@ func TestController_DeployInferenceService(t *testing.T) {
 			})
 
 			istioClient := fakeistio.NewSimpleClientset().NetworkingV1beta1().(*fakeistionetworking.FakeNetworkingV1beta1)
-			istioClient.PrependReactor(patchMethod, virtualServiceResource, func(action ktesting.Action) (handled bool, ret runtime.Object, err error) {
-				return true, tt.createVsResult.vs, tt.createVsResult.err
-			})
+			if tt.createVsResult != nil && tt.createVsResult.vs != nil {
+				istioClient.PrependReactor(patchMethod, virtualServiceResource, func(action ktesting.Action) (handled bool, ret runtime.Object, err error) {
+					return true, tt.createVsResult.vs, tt.createVsResult.err
+				})
+			}
 
 			deployConfig := config.DeploymentConfig{
 				DeploymentTimeout:                  tt.deployTimeout,
@@ -675,6 +706,9 @@ func TestController_DeployInferenceService(t *testing.T) {
 					ImageName:             "ghcr.io/caraml-dev/merlin-transformer-test",
 					FeastServingKeepAlive: &config.FeastServingKeepAliveConfig{},
 				},
+				UserContainerCPUDefaultLimit:          userContainerCPUDefaultLimit,
+				UserContainerCPULimitRequestFactor:    userContainerCPULimitRequestFactor,
+				UserContainerMemoryLimitRequestFactor: userContainerMemoryLimitRequestFactor,
 			}
 
 			containerFetcher := NewContainerFetcher(v1Client, clusterMetadata)
@@ -707,7 +741,7 @@ func TestGetCurrentDeploymentScale(t *testing.T) {
 
 	tests := map[string]struct {
 		components    map[kservev1beta1.ComponentType]kservev1beta1.ComponentStatusSpec
-		rFunc         func(action k8stesting.Action) (bool, runtime.Object, error)
+		rFunc         func(action ktesting.Action) (bool, runtime.Object, error)
 		expectedScale clusterresource.DeploymentScale
 	}{
 		"failure | revision not found": {
@@ -716,8 +750,8 @@ func TestGetCurrentDeploymentScale(t *testing.T) {
 					LatestCreatedRevision: "test-predictor-0",
 				},
 			},
-			rFunc: func(action k8stesting.Action) (bool, runtime.Object, error) {
-				expAction := k8stesting.NewGetAction(resourceItem, testNamespace, "test-predictor-0")
+			rFunc: func(action ktesting.Action) (bool, runtime.Object, error) {
+				expAction := ktesting.NewGetAction(resourceItem, testNamespace, "test-predictor-0")
 				// Check that the method is called with the expected action
 				assert.Equal(t, expAction, action)
 				// Return nil object and error to indicate non existent object
@@ -731,8 +765,8 @@ func TestGetCurrentDeploymentScale(t *testing.T) {
 					LatestCreatedRevision: "test-predictor-0",
 				},
 			},
-			rFunc: func(action k8stesting.Action) (bool, runtime.Object, error) {
-				expAction := k8stesting.NewGetAction(resourceItem, testNamespace, "test-predictor-0")
+			rFunc: func(action ktesting.Action) (bool, runtime.Object, error) {
+				expAction := ktesting.NewGetAction(resourceItem, testNamespace, "test-predictor-0")
 				// Check that the method is called with the expected action
 				assert.Equal(t, expAction, action)
 				// Return test response
@@ -750,8 +784,8 @@ func TestGetCurrentDeploymentScale(t *testing.T) {
 					LatestCreatedRevision: "test-predictor-0",
 				},
 			},
-			rFunc: func(action k8stesting.Action) (bool, runtime.Object, error) {
-				expAction := k8stesting.NewGetAction(resourceItem, testNamespace, "test-predictor-0")
+			rFunc: func(action ktesting.Action) (bool, runtime.Object, error) {
+				expAction := ktesting.NewGetAction(resourceItem, testNamespace, "test-predictor-0")
 				// Check that the method is called with the expected action
 				assert.Equal(t, expAction, action)
 				// Return test response
@@ -775,8 +809,8 @@ func TestGetCurrentDeploymentScale(t *testing.T) {
 					LatestCreatedRevision: "test-svc-0",
 				},
 			},
-			rFunc: func(action k8stesting.Action) (bool, runtime.Object, error) {
-				expAction := k8stesting.NewGetAction(resourceItem, testNamespace, "test-svc-0")
+			rFunc: func(action ktesting.Action) (bool, runtime.Object, error) {
+				expAction := ktesting.NewGetAction(resourceItem, testNamespace, "test-svc-0")
 				// Check that the method is called with the expected action
 				assert.Equal(t, expAction, action)
 				// Return test response
@@ -810,6 +844,9 @@ func TestGetCurrentDeploymentScale(t *testing.T) {
 					ImageName:             "ghcr.io/caraml-dev/merlin-transformer-test",
 					FeastServingKeepAlive: &config.FeastServingKeepAliveConfig{},
 				},
+				UserContainerCPUDefaultLimit:          userContainerCPUDefaultLimit,
+				UserContainerCPULimitRequestFactor:    userContainerCPULimitRequestFactor,
+				UserContainerMemoryLimitRequestFactor: userContainerMemoryLimitRequestFactor,
 			}
 			containerFetcher := NewContainerFetcher(v1Client, clusterMetadata)
 			templater := clusterresource.NewInferenceServiceTemplater(deployConfig)
